@@ -9,6 +9,6 @@ COPY requirements.txt ./
 RUN python3 -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
 
-COPY bot.py format_selector.py download_jobs.py ./
+COPY bot.py format_selector.py download_jobs.py stream_jobs.py ./
 ENV PATH="/opt/venv/bin:${PATH}" PYTHONUNBUFFERED=1
 CMD ["python", "bot.py"]

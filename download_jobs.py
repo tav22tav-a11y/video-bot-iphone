@@ -16,6 +16,7 @@ from pathlib import Path
 
 import yt_dlp
 from aiohttp import web
+import stream_jobs
 
 log = logging.getLogger("video_jobs")
 ROOT = Path("/tmp/video-bot-downloads")
@@ -163,6 +164,7 @@ async def start_server(_application) -> None:
     app = web.Application(client_max_size=2048)
     app.router.add_get("/health", health)
     app.router.add_get("/f/{token}", send_file)
+    stream_jobs.register_routes(app)
     RUNNER = web.AppRunner(app)
     await RUNNER.setup()
     site = web.TCPSite(RUNNER, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
