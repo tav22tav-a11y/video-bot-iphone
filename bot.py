@@ -23,7 +23,8 @@ from telegram.error import TelegramError
 from telegram.ext import (ApplicationBuilder, CallbackQueryHandler, CommandHandler,
                           ContextTypes, MessageHandler, filters)
 
-from format_selector import direct_formats, human_size
+from format_selector import human_size
+import download_jobs
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -99,21 +100,18 @@ def available_heights(info: dict) -> list[int]:
 
 
 def quality_keyboard(key: str, info: dict, original_url: str) -> tuple[InlineKeyboardMarkup, int]:
-    buttons = []
-    # Telegram's InlineKeyboardButton URL limit is 256 characters.
-    # Very long signed CDN URLs need an HTTPS redirect endpoint in a future release.
-    direct = [f for f in direct_formats(info) if len(f["url"]) <= 256]
-    for f in direct:
-        quality = f"{f['height']}p" if f["height"] else "MP4"
-        label = f"📱 {quality} · {human_size(f['size'])}"
-        buttons.append([InlineKeyboardButton(label[:60], url=f["url"])])
+    """Choose a resolution BEFORE beginning server-side preparation."""
+    heights = available_heights(info)[:9]
+    buttons = [[InlineKeyboardButton(f"📱 Скачать {height}p в Файлы",
+                  callback_data=f"save:{key}:{height}")]
+               for height in heights]
+    buttons.append([InlineKeyboardButton("📱 Авто / лучшее качество",
+                                         callback_data=f"save:{key}:best")])
     if ALLOW_TELEGRAM_FALLBACK:
-        buttons.append([InlineKeyboardButton("📨 Отправить в Telegram (до 49 МБ)",
+        buttons.append([InlineKeyboardButton("📨 Маленький файл в Telegram (до 49 МБ)",
                                             callback_data=f"tg:{key}")])
-    buttons.append([InlineKeyboardButton("❔ Как сохранить в Файлы", callback_data="help:files")])
-    if len(original_url) <= 256:
-        buttons.append([InlineKeyboardButton("🌐 Открыть исходную страницу", url=original_url)])
-    return InlineKeyboardMarkup(buttons), len(direct)
+    buttons.append([InlineKeyboardButton("❔ Где найти скачанное видео?", callback_data="help:files")])
+    return InlineKeyboardMarkup(buttons), len(heights)
 
 
 def download_small_video(url: str, height: int | None, folder: str) -> Path:
@@ -147,11 +145,13 @@ def download_small_video(url: str, height: int | None, folder: str) -> Path:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
-        "Привет! 📱 Пришли публичную ссылку на видео.\n\n"
-        "Если есть прямой MP4 со звуком, покажу кнопку для скачивания через Safari в «Файлы». "
-        "Такое видео не загружается на сервер бота и не отправляется файлом в Telegram.\n\n"
-        "Для небольших видео пока сохранена отправка в чат (до 49 МБ). "
-        "Если сайт отдаёт HLS/DASH или защищённый поток, прямая кнопка может быть недоступна."
+        "Привет! 📱 Пришли ссылку на публичное видео.\n\n"
+        "1. Выбери качество (360p, 720p, 1080p и другие).\n"
+        "2. Я подготовлю файл из онлайн-потока, если он открыт и поддерживается.\n"
+        "3. Нажми «Скачать в Файлы» и открой ссылку в Safari.\n\n"
+        f"Пока на одну загрузку действует лимит {download_jobs.MAX_MB} МБ. "
+        "Файлы хранятся на сервере только 20 минут, не отправляются в Telegram "
+        "и автоматически удаляются. DRM и закрытые потоки не поддерживаются."
     )
 
 
@@ -173,16 +173,13 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             videos.pop(next(iter(videos)))
         videos[key] = {"url": url, "title": str(info.get("title") or "Видео")[:150],
                        "heights": available_heights(info)}
-        kb, direct_count = quality_keyboard(key, info, url)
+        kb, quality_count = quality_keyboard(key, info, url)
         title = videos[key]["title"]
         text = (f"🎬 {title}\n\n"
-                f"📱 Прямых вариантов для iPhone: {direct_count}.\n"
-                "Нажми качество, затем при необходимости выбери «Открыть в Safari». "
-                "Если открывается видеоплеер, используй меню «Поделиться» → «Сохранить в Файлы».\n\n")
-        if not direct_count:
-            text += ("⚠️ Прямого MP4 со звуком не найдено. Возможно, видео состоит из HLS/DASH "
-                     "или требует доступа. Для больших файлов в таком случае понадобится отдельная версия сервера.\n\n")
-        text += "Ссылки на прямые файлы могут истекать или требовать входа на сайт."
+                "Выбери качество ниже. После выбора бот подготовит файл из доступного потока "
+                "(MP4, HLS или DASH) и пришлёт отдельную кнопку для сохранения в «Файлы».\n\n"
+                f"Лимит бета-версии: {download_jobs.MAX_MB} МБ на видео. "
+                "Ссылка действует 20 минут.")
         await status.edit_text(text, reply_markup=kb)
     except FriendlyError as exc:
         await msg.reply_text(f"⚠️ {exc}")
@@ -200,13 +197,65 @@ async def help_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if query:
         await query.answer()
         await query.message.reply_text(
-            "📱 На iPhone:\n"
-            "1. Нажми кнопку качества и открой ссылку в Safari (если Telegram предлагает встроенный браузер).\n"
-            "2. Если Safari начинает загрузку — файл появится в «Файлы» → «Загрузки».\n"
-            "3. Если открывается видео — открой меню «Поделиться» и попробуй «Сохранить в Файлы».\n"
-            "4. Место загрузок меняется в Настройки → Приложения → Safari → Загрузки.\n"
-            "Если файл не открывается, сайт может требовать отдельные заголовки, авторизацию или тот же IP."
+            "📱 Как сохранить на iPhone:\n"
+            "1. Отправь ссылку и выбери качество.\n"
+            "2. Когда файл будет готов, нажми «📥 Скачать в Файлы».\n"
+            "3. Если открылся встроенный браузер Telegram, выбери «Открыть в Safari».\n"
+            "4. В Safari файл появится в «Файлы» → «Загрузки» или в выбранном месте.\n"
+            "Если видео не обрабатывается, сайт может не отдавать публичный поток или использовать DRM."
         )
+
+
+async def save_to_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    _, key, quality = query.data.split(":", 2)
+    video = context.user_data.get("videos", {}).get(key)
+    if not video:
+        await query.message.reply_text("Ссылка устарела. Пришли видео снова.")
+        return
+    if context.user_data.get("busy"):
+        await query.message.reply_text("⏳ Сейчас уже готовится другое видео.")
+        return
+    if not download_jobs.public_base_url():
+        await query.message.reply_text("⚠️ Сервер скачивания пока не настроен.")
+        return
+    uid = query.from_user.id
+    if not download_jobs.quota(uid):
+        await query.message.reply_text("⚠️ Лимит: не более 3 попыток за час и 40 в сутки на весь бот.")
+        return
+    context.user_data["busy"] = True
+    height = None if quality == "best" else int(quality)
+    status = await query.message.reply_text("⏳ Готовлю видео выбранного качества. Это может занять несколько минут…")
+
+    async def task() -> None:
+        try:
+            async with download_jobs.SLOTS:
+                token, filename, size = await download_jobs.prepare_and_register(video["url"], height)
+            address = f"{download_jobs.public_base_url()}/f/{token}"
+            markup = InlineKeyboardMarkup([[InlineKeyboardButton("📥 Скачать в Файлы", url=address)]])
+            await status.edit_text(
+                f"✅ Готово! {filename} — {human_size(size)}\n"
+                "Нажми кнопку ниже. Если Telegram откроет встроенный браузер, "
+                "выбери «Открыть в Safari»; файл будет в загрузках iPhone.\n"
+                "Ссылка действительна 20 минут, затем файл удалится.",
+                reply_markup=markup)
+        except download_jobs.DownloadTooBig:
+            await status.edit_text(
+                f"⚠️ Видео превышает лимит {download_jobs.MAX_MB} МБ. "
+                "Попробуй меньшее качество — для гигабайтных файлов нужна следующая версия сервера.")
+        except download_jobs.DownloadTooSlow:
+            await status.edit_text("⚠️ Подготовка заняла слишком много времени. Попробуй меньший размер.")
+        except yt_dlp.utils.DownloadError:
+            await status.edit_text(
+                "⚠️ Не удалось скачать поток. Видео может быть недоступно, требовать входа или использовать DRM.")
+        except Exception:
+            log.exception("File preparation failed")
+            await status.edit_text("⚠️ Не удалось подготовить файл. Попробуй другое качество или видео.")
+        finally:
+            context.user_data["busy"] = False
+
+    context.application.create_task(task(), update=update)
 
 
 async def telegram_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -277,14 +326,17 @@ def main() -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         raise SystemExit("Задай TELEGRAM_BOT_TOKEN как секретную переменную Railway.")
-    app = ApplicationBuilder().token(token).concurrent_updates(True).build()
+    app = (ApplicationBuilder().token(token).concurrent_updates(True)
+           .post_init(download_jobs.start_server)
+           .post_shutdown(download_jobs.stop_server).build())
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_link))
     app.add_handler(CallbackQueryHandler(help_files, pattern=r"^help:files$"))
+    app.add_handler(CallbackQueryHandler(save_to_files, pattern=r"^save:[0-9a-f]{10}:(best|[0-9]+)$"))
     app.add_handler(CallbackQueryHandler(telegram_menu, pattern=r"^tg:[0-9a-f]{10}$"))
     app.add_handler(CallbackQueryHandler(telegram_download, pattern=r"^dl:[0-9a-f]{10}:(best|[0-9]+)$"))
-    print("Video Bot 2.0 started", flush=True)
+    print("Video Bot 2.1: server-side stream preparation started", flush=True)
     app.run_polling(drop_pending_updates=True)
 
 
