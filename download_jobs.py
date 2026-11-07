@@ -55,7 +55,7 @@ def format_selector(height: int | None) -> str:
     limit = f"[height<={height}]" if height else ""
     # Progressive MP4, split MP4/M4A, then adaptive HLS/DASH fallback.
     return (f"b{limit}[ext=mp4]/bv{limit}[ext=mp4]+ba[ext=m4a]/"
-            f"bv{limit}+ba/b{limit}/b")
+            f"bv{limit}+ba/b{limit}" + ("/b" if not height else ""))
 
 
 def prepare_video(url: str, height: int | None, work: Path) -> Path:
