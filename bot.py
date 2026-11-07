@@ -1,4 +1,8 @@
-"""Telegram video downloader MVP (public, non-DRM videos only)."""
+"""Video Bot 2.0 (beta): prefer direct-to-iPhone links; Telegram file is optional.
+
+IMPORTANT: direct URLs are best-effort and limited to public progressive files.
+No DRM/private access bypass. Media is not saved on our server in direct mode.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -16,58 +20,56 @@ from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.error import TelegramError
-from telegram.ext import (
-    ApplicationBuilder,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+from telegram.ext import (ApplicationBuilder, CallbackQueryHandler, CommandHandler,
+                          ContextTypes, MessageHandler, filters)
+
+from format_selector import direct_formats, human_size
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# Redact HTTP URLs (especially Telegram bot token) from library logs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("video_bot")
 
-MAX_FILE_BYTES = 49 * 1024 * 1024  # Telegram public Bot API: 50 MB upload cap
-MAX_URL_CHARS = 2048
-DOWNLOAD_SLOTS = asyncio.Semaphore(2)
+MAX_TELEGRAM_FILE_BYTES = 49 * 1024 * 1024
+MAX_URL_LENGTH = 2048
 MEDIA_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".flv", ".m4v", ".ts"}
+DOWNLOAD_SLOTS = asyncio.Semaphore(2)
+ALLOW_TELEGRAM_FALLBACK = os.getenv("ALLOW_TELEGRAM_FALLBACK", "true").lower() == "true"
 
 
-class VideoAccessError(Exception):
-    """User-friendly error."""
+class FriendlyError(Exception):
+    pass
 
 
-def validate_public_url(url: str) -> str:
-    """Reject obviously unsafe URL inputs. NOT a substitute for network egress policy."""
+def check_public_url(url: str) -> str:
+    """Fast validation. For a public bot also restrict outbound network at host level.
+
+    yt-dlp may follow other URLs returned by the source; this does not protect
+    against every SSRF/DNS-rebinding path. Use an outbound firewall in prod.
+    """
     url = url.strip()
-    if len(url) > MAX_URL_CHARS:
-        raise VideoAccessError("Ссылка слишком длинная.")
+    if len(url) > MAX_URL_LENGTH:
+        raise FriendlyError("Слишком длинная ссылка.")
     try:
         parsed = urlsplit(url)
-        if parsed.scheme not in {"https", "http"} or not parsed.hostname:
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
             raise ValueError("scheme/host")
-        if parsed.username or parsed.password:
-            raise ValueError("credentials")
-        if parsed.port not in (None, 80, 443):
-            raise ValueError("port")
-        hostname = parsed.hostname
-        if hostname.lower() == "localhost" or hostname.lower().endswith((".local", ".internal")):
-            raise ValueError("local host")
-        # Reject internal/private DNS results, as well as private literal IPs.
-        addresses = socket.getaddrinfo(hostname, parsed.port or 443, type=socket.SOCK_STREAM)
-        if not addresses:
-            raise ValueError("no DNS")
-        if any(not ipaddress.ip_address(result[4][0]).is_global for result in addresses):
+        if parsed.username or parsed.password or parsed.port not in (None, 80, 443):
+            raise ValueError("credentials/port")
+        host = parsed.hostname.lower().strip(".")
+        if host == "localhost" or host.endswith((".local", ".internal")):
+            raise ValueError("private hostname")
+        answers = socket.getaddrinfo(host, parsed.port or 443, type=socket.SOCK_STREAM)
+        if not answers or any(not ipaddress.ip_address(x[4][0]).is_global for x in answers):
             raise ValueError("private DNS")
-    except (ValueError, socket.gaierror, UnicodeError, OSError) as exc:
-        raise VideoAccessError("Пришлите обычную публичную ссылку на страницу с видео (http/https).") from exc
+    except (ValueError, socket.gaierror, OSError, UnicodeError) as exc:
+        raise FriendlyError("Нужна публичная ссылка на видео (https://...).") from exc
     return url
 
 
-def extract_video(url: str) -> dict:
-    options = {
+def inspect_video(url: str) -> dict:
+    with yt_dlp.YoutubeDL({
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
@@ -76,166 +78,197 @@ def extract_video(url: str) -> dict:
         "socket_timeout": 20,
         "retries": 2,
         "ignoreerrors": False,
-    }
-    with yt_dlp.YoutubeDL(options) as ydl:
-        info = ydl.extract_info(url, download=False)
-    if not isinstance(info, dict) or info.get("_type") in {"playlist", "multi_video"}:
-        raise VideoAccessError("Нужна ссылка на конкретное видео, а не на плейлист.")
-    if info.get("is_live"):
-        raise VideoAccessError("Прямые трансляции в этой версии не поддерживаются.")
-    return info
+        "js_runtimes": {"node": {}},
+    }) as ydl:
+        data = ydl.extract_info(url, download=False)
+    if not isinstance(data, dict) or data.get("_type") in ("playlist", "multi_video"):
+        raise FriendlyError("Отправь ссылку на одно видео, не на плейлист.")
+    if data.get("is_live"):
+        raise FriendlyError("Прямые трансляции не поддерживаются.")
+    return data
 
 
 def available_heights(info: dict) -> list[int]:
-    """Expose only resolutions actually reported by the source."""
-    heights = {
-        int(item["height"])
-        for item in info.get("formats", [])
-        if isinstance(item, dict)
-        and item.get("vcodec") != "none"
-        and isinstance(item.get("height"), (int, float))
-        and item["height"] > 0
-    }
-    if not heights and isinstance(info.get("height"), (int, float)):
+    formats = info.get("formats") or []
+    heights = {int(x["height"]) for x in formats if isinstance(x, dict)
+               and x.get("vcodec") != "none" and isinstance(x.get("height"), (float, int))
+               and x["height"] > 0}
+    if not heights and isinstance(info.get("height"), (float, int)):
         heights.add(int(info["height"]))
-    return sorted(heights)
+    return sorted(heights, reverse=True)
 
 
-def quality_keyboard(key: str, heights: list[int], url: str) -> InlineKeyboardMarkup:
-    buttons: list[list[InlineKeyboardButton]] = []
-    row: list[InlineKeyboardButton] = []
-    for height in sorted(heights, reverse=True)[:12]:
-        row.append(InlineKeyboardButton(f"⬇️ {height}p", callback_data=f"dl:{key}:{height}"))
-        if len(row) == 2:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
-    buttons.append([InlineKeyboardButton("⭐ Лучшее доступное", callback_data=f"dl:{key}:best")])
-    buttons.append([InlineKeyboardButton("🔗 Открыть страницу видео", url=url)])
-    return InlineKeyboardMarkup(buttons)
+def quality_keyboard(key: str, info: dict, original_url: str) -> tuple[InlineKeyboardMarkup, int]:
+    buttons = []
+    # Telegram's InlineKeyboardButton URL limit is 256 characters.
+    # Very long signed CDN URLs need an HTTPS redirect endpoint in a future release.
+    direct = [f for f in direct_formats(info) if len(f["url"]) <= 256]
+    for f in direct:
+        quality = f"{f['height']}p" if f["height"] else "MP4"
+        label = f"📱 {quality} · {human_size(f['size'])}"
+        buttons.append([InlineKeyboardButton(label[:60], url=f["url"])])
+    if ALLOW_TELEGRAM_FALLBACK:
+        buttons.append([InlineKeyboardButton("📨 Отправить в Telegram (до 49 МБ)",
+                                            callback_data=f"tg:{key}")])
+    buttons.append([InlineKeyboardButton("❔ Как сохранить в Файлы", callback_data="help:files")])
+    if len(original_url) <= 256:
+        buttons.append([InlineKeyboardButton("🌐 Открыть исходную страницу", url=original_url)])
+    return InlineKeyboardMarkup(buttons), len(direct)
 
 
-def download_video(url: str, height: int | None, folder: str) -> Path:
-    def stop_large_download(state: dict) -> None:
-        if state.get("status") == "downloading" and state.get("downloaded_bytes", 0) > MAX_FILE_BYTES:
-            raise VideoAccessError("Файл превышает лимит Telegram (50 МБ). Выберите качество ниже.")
-
-    fmt = "bv+ba/b" if height is None else f"bv[height<={height}]+ba/b[height<={height}]"
-    options = {
-        "format": fmt,
+def download_small_video(url: str, height: int | None, folder: str) -> Path:
+    def check_size(d: dict) -> None:
+        if d.get("status") == "downloading" and d.get("downloaded_bytes", 0) > MAX_TELEGRAM_FILE_BYTES:
+            raise FriendlyError("Видео больше лимита Telegram. Попробуй прямую загрузку в Файлы.")
+    format_spec = "bv+ba/b" if height is None else f"bv[height<={height}]+ba/b[height<={height}]"
+    with yt_dlp.YoutubeDL({
+        "format": format_spec,
         "outtmpl": str(Path(folder) / "video.%(ext)s"),
         "noplaylist": True,
-        "playlist_items": "1",
         "quiet": True,
         "no_warnings": True,
         "socket_timeout": 20,
         "retries": 2,
         "fragment_retries": 2,
-        "max_filesize": MAX_FILE_BYTES,
-        "progress_hooks": [stop_large_download],
-    }
-    with yt_dlp.YoutubeDL(options) as ydl:
+        "js_runtimes": {"node": {}},
+        "max_filesize": MAX_TELEGRAM_FILE_BYTES,
+        "merge_output_format": "mp4",
+        "progress_hooks": [check_size],
+    }) as ydl:
         ydl.download([url])
-
     files = [p for p in Path(folder).iterdir() if p.is_file() and p.suffix.lower() in MEDIA_EXTENSIONS]
     if not files:
-        raise VideoAccessError("Видео не удалось сохранить. Возможно, сайту нужен вход или доступ ограничен.")
-    # Prefer the combined output (video.mp4/video.mkv) over temporary split streams.
-    completed = [p for p in files if p.stem == "video"]
-    path = max(completed or files, key=lambda p: p.stat().st_size)
-    if path.stat().st_size > MAX_FILE_BYTES:
-        raise VideoAccessError("Готовый файл больше 50 МБ. Выберите более низкое качество.")
-    if path.stat().st_size == 0:
-        raise VideoAccessError("Видео оказалось пустым.")
+        raise FriendlyError("Не получилось сохранить маленький файл. Попробуй другое качество.")
+    path = max(files, key=lambda p: p.stat().st_size)
+    if not 0 < path.stat().st_size <= MAX_TELEGRAM_FILE_BYTES:
+        raise FriendlyError("Готовый файл превышает 49 МБ. Попробуй прямую загрузку в Файлы.")
     return path
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
-        "👋 Привет! Пришли ссылку на общедоступное видео. "
-        "Я проверю доступные качества и предложу скачать файл.\n\n"
-        "Сайты с DRM-защитой и закрытые видео не поддерживаются. "
-        "Через стандартный Telegram Bot API можно отправить файл до 50 МБ."
+        "Привет! 📱 Пришли публичную ссылку на видео.\n\n"
+        "Если есть прямой MP4 со звуком, покажу кнопку для скачивания через Safari в «Файлы». "
+        "Такое видео не загружается на сервер бота и не отправляется файлом в Telegram.\n\n"
+        "Для небольших видео пока сохранена отправка в чат (до 49 МБ). "
+        "Если сайт отдаёт HLS/DASH или защищённый поток, прямая кнопка может быть недоступна."
     )
 
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    if not message or not message.text:
+    msg = update.effective_message
+    if not msg or not msg.text:
         return
     if context.user_data.get("busy"):
-        await message.reply_text("⏳ Предыдущее видео ещё обрабатывается.")
+        await msg.reply_text("⏳ Предыдущее видео ещё обрабатывается.")
         return
     context.user_data["busy"] = True
     try:
-        url = await asyncio.to_thread(validate_public_url, message.text)
-        status = await message.reply_text("🔎 Проверяю ссылку и доступные качества…")
-        info = await asyncio.to_thread(extract_video, url)
-        heights = available_heights(info)
+        url = await asyncio.to_thread(check_public_url, msg.text)
+        status = await msg.reply_text("🔎 Проверяю доступные форматы…")
+        info = await asyncio.to_thread(inspect_video, url)
         key = secrets.token_hex(5)
-        # Keep only recent links per user; callback data contains a key, never the URL.
         videos = context.user_data.setdefault("videos", {})
         if len(videos) >= 10:
             videos.pop(next(iter(videos)))
-        videos[key] = {"url": url, "title": str(info.get("title") or "Видео")[:150]}
+        videos[key] = {"url": url, "title": str(info.get("title") or "Видео")[:150],
+                       "heights": available_heights(info)}
+        kb, direct_count = quality_keyboard(key, info, url)
         title = videos[key]["title"]
-        choices = ", ".join(f"{x}p" for x in heights) if heights else "авто"
-        await status.edit_text(
-            f"🎬 {title}\n\nДоступные качества: {choices}.\nВыберите нужное:",
-            reply_markup=quality_keyboard(key, heights, url),
-        )
-    except VideoAccessError as exc:
-        await message.reply_text(f"⚠️ {exc}")
+        text = (f"🎬 {title}\n\n"
+                f"📱 Прямых вариантов для iPhone: {direct_count}.\n"
+                "Нажми качество, затем при необходимости выбери «Открыть в Safari». "
+                "Если открывается видеоплеер, используй меню «Поделиться» → «Сохранить в Файлы».\n\n")
+        if not direct_count:
+            text += ("⚠️ Прямого MP4 со звуком не найдено. Возможно, видео состоит из HLS/DASH "
+                     "или требует доступа. Для больших файлов в таком случае понадобится отдельная версия сервера.\n\n")
+        text += "Ссылки на прямые файлы могут истекать или требовать входа на сайт."
+        await status.edit_text(text, reply_markup=kb)
+    except FriendlyError as exc:
+        await msg.reply_text(f"⚠️ {exc}")
     except yt_dlp.utils.DownloadError:
-        await message.reply_text("⚠️ Не удалось прочитать видео. Проверьте ссылку и доступность видео без входа.")
+        await msg.reply_text("⚠️ Сайт не дал доступ к видео или пока не поддерживается. Отправь прямую ссылку на видеоролик.")
     except Exception:
-        log.exception("Video inspection failed")
-        await message.reply_text("⚠️ Ошибка при обработке ссылки. Попробуйте другую.")
+        log.exception("Failed to inspect video")
+        await msg.reply_text("⚠️ Ошибка при проверке ссылки.")
     finally:
         context.user_data["busy"] = False
 
 
-async def handle_quality(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def help_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    if not query or not query.data:
-        return
+    if query:
+        await query.answer()
+        await query.message.reply_text(
+            "📱 На iPhone:\n"
+            "1. Нажми кнопку качества и открой ссылку в Safari (если Telegram предлагает встроенный браузер).\n"
+            "2. Если Safari начинает загрузку — файл появится в «Файлы» → «Загрузки».\n"
+            "3. Если открывается видео — открой меню «Поделиться» и попробуй «Сохранить в Файлы».\n"
+            "4. Место загрузок меняется в Настройки → Приложения → Safari → Загрузки.\n"
+            "Если файл не открывается, сайт может требовать отдельные заголовки, авторизацию или тот же IP."
+        )
+
+
+async def telegram_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
     await query.answer()
+    key = query.data.split(":", 1)[1]
+    video = context.user_data.get("videos", {}).get(key)
+    if not video:
+        await query.message.reply_text("Ссылка устарела. Пришли её заново.")
+        return
+    buttons = []
+    heights = video["heights"][:10]
+    row = []
+    for height in heights:
+        row.append(InlineKeyboardButton(f"📨 {height}p", callback_data=f"dl:{key}:{height}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("📨 Авто (до 49 МБ)", callback_data=f"dl:{key}:best")])
+    await query.message.reply_text("Выбери качество. Telegram ограничивает размер файла 50 МБ.",
+                                   reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def telegram_download(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not ALLOW_TELEGRAM_FALLBACK:
+        await query.message.reply_text("Отправка файлов в Telegram отключена.")
+        return
     _, key, quality = query.data.split(":", 2)
     video = context.user_data.get("videos", {}).get(key)
     if not video:
-        await query.message.reply_text("Ссылка устарела. Пришлите её ещё раз.")
+        await query.message.reply_text("Ссылка устарела. Пришли её заново.")
         return
     if context.user_data.get("busy"):
-        await query.message.reply_text("⏳ Подождите завершения предыдущей загрузки.")
+        await query.message.reply_text("⏳ Сначала заверши прошлую загрузку.")
         return
     context.user_data["busy"] = True
     try:
-        height = None if quality == "best" else int(quality)
-        status = await query.message.reply_text(f"⏬ Скачиваю {quality if height is None else str(height) + 'p'}…")
+        status = await query.message.reply_text("⏬ Скачиваю маленький файл…")
+        height = int(quality) if quality != "best" else None
         async with DOWNLOAD_SLOTS:
             with tempfile.TemporaryDirectory(prefix="video-bot-") as folder:
-                path = await asyncio.to_thread(download_video, video["url"], height, folder)
-                await status.edit_text("📤 Отправляю файл…")
+                file = await asyncio.to_thread(download_small_video, video["url"], height, folder)
+                await status.edit_text("📤 Отправляю видео…")
                 await context.bot.send_chat_action(query.message.chat_id, ChatAction.UPLOAD_DOCUMENT)
-                with path.open("rb") as handle:
-                    await context.bot.send_document(
-                        chat_id=query.message.chat_id,
-                        document=handle,
-                        filename=path.name,
-                        caption=video["title"][:1024],
-                        read_timeout=120,
-                        write_timeout=120,
-                    )
-        await status.edit_text("✅ Готово! Можете выбрать другое качество по кнопкам выше.")
-    except VideoAccessError as exc:
+                with file.open("rb") as fp:
+                    await context.bot.send_document(chat_id=query.message.chat_id,
+                                                    document=fp, filename=file.name,
+                                                    caption=video["title"],
+                                                    read_timeout=120, write_timeout=120)
+        await status.edit_text("✅ Готово!")
+    except FriendlyError as exc:
         await query.message.reply_text(f"⚠️ {exc}")
-    except (yt_dlp.utils.DownloadError, TelegramError):
-        log.exception("Download/send failed")
-        await query.message.reply_text("⚠️ Не удалось скачать или отправить видео. Попробуйте другое качество.")
+    except (TelegramError, yt_dlp.utils.DownloadError):
+        log.exception("Small download failed")
+        await query.message.reply_text("⚠️ Не удалось отправить файл; попробуй меньший размер.")
     except Exception:
         log.exception("Unexpected download failure")
-        await query.message.reply_text("⚠️ Произошла ошибка. Попробуйте другое качество или ссылку.")
+        await query.message.reply_text("⚠️ Ошибка скачивания.")
     finally:
         context.user_data["busy"] = False
 
@@ -243,13 +276,15 @@ async def handle_quality(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 def main() -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
-        raise SystemExit("Укажите TELEGRAM_BOT_TOKEN в файле .env")
+        raise SystemExit("Задай TELEGRAM_BOT_TOKEN как секретную переменную Railway.")
     app = ApplicationBuilder().token(token).concurrent_updates(True).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_link))
-    app.add_handler(CallbackQueryHandler(handle_quality, pattern=r"^dl:[0-9a-f]{10}:(best|[0-9]+)$"))
-    print("Бот запущен. Откройте его в Telegram и отправьте ссылку.")
+    app.add_handler(CallbackQueryHandler(help_files, pattern=r"^help:files$"))
+    app.add_handler(CallbackQueryHandler(telegram_menu, pattern=r"^tg:[0-9a-f]{10}$"))
+    app.add_handler(CallbackQueryHandler(telegram_download, pattern=r"^dl:[0-9a-f]{10}:(best|[0-9]+)$"))
+    print("Video Bot 2.0 started", flush=True)
     app.run_polling(drop_pending_updates=True)
 
 
