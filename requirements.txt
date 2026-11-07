@@ -1,4 +1,0 @@
-python-telegram-bot>=22,<24
-yt-dlp[default]
-python-dotenv>=1,<2
-aiohttp>=3.12,<4
