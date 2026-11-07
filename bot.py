@@ -25,6 +25,7 @@ from telegram.ext import (ApplicationBuilder, CallbackQueryHandler, CommandHandl
 
 from format_selector import human_size
 import download_jobs
+import stream_jobs
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -147,11 +148,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         "Привет! 📱 Пришли ссылку на публичное видео.\n\n"
         "1. Выбери качество (360p, 720p, 1080p и другие).\n"
-        "2. Я подготовлю файл из онлайн-потока, если он открыт и поддерживается.\n"
-        "3. Нажми «Скачать в Файлы» и открой ссылку в Safari.\n\n"
-        f"Пока на одну загрузку действует лимит {download_jobs.MAX_MB} МБ. "
-        "Файлы хранятся на сервере только 20 минут, не отправляются в Telegram "
-        "и автоматически удаляются. DRM и закрытые потоки не поддерживаются."
+        "2. Нажми «Скачать в Файлы». В Safari начнётся загрузка прямо в память телефона.\n"
+        "3. Для HLS/DASH я попробую собирать поток на лету — без сохранения файла на сервере.\n\n"
+        "Для потоковой загрузки нет лимита размера файла в мегабайтах, "
+        "но Railway ограничивает продолжительность соединения. "
+        "Прерванную загрузку пока нельзя продолжить с того же места. "
+        "DRM, закрытый доступ и некоторые сайты не поддерживаются."
     )
 
 
@@ -176,10 +178,11 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         kb, quality_count = quality_keyboard(key, info, url)
         title = videos[key]["title"]
         text = (f"🎬 {title}\n\n"
-                "Выбери качество ниже. После выбора бот подготовит файл из доступного потока "
-                "(MP4, HLS или DASH) и пришлёт отдельную кнопку для сохранения в «Файлы».\n\n"
-                f"Лимит бета-версии: {download_jobs.MAX_MB} МБ на видео. "
-                "Ссылка действует 20 минут.")
+                "Выбери качество ниже, затем нажми кнопку загрузки. "
+                "Safari получит доступный MP4, HLS или DASH по потоку, "
+                "не сохраняя полное видео на сервере.\n\n"
+                "Нет фиксированного ограничения на размер файла. "
+                "Ссылка начнёт загрузку при открытии в Safari и действительна 10 минут.")
         await status.edit_text(text, reply_markup=kb)
     except FriendlyError as exc:
         await msg.reply_text(f"⚠️ {exc}")
@@ -199,14 +202,16 @@ async def help_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await query.message.reply_text(
             "📱 Как сохранить на iPhone:\n"
             "1. Отправь ссылку и выбери качество.\n"
-            "2. Когда файл будет готов, нажми «📥 Скачать в Файлы».\n"
-            "3. Если открылся встроенный браузер Telegram, выбери «Открыть в Safari».\n"
-            "4. В Safari файл появится в «Файлы» → «Загрузки» или в выбранном месте.\n"
+            "2. После выбора качества нажми «📥 Скачать в Файлы».\n"
+            "3. Открой ссылку в Safari, если Telegram открывает встроенный браузер.\n"
+            "4. В Safari начнётся загрузка; файл найдёшь в «Файлы» → «Загрузки».\n"
+            "5. Если интернет оборвётся, нужно запустить загрузку заново.\n"
             "Если видео не обрабатывается, сайт может не отдавать публичный поток или использовать DRM."
         )
 
 
 async def save_to_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Generate an on-demand HTTPS streaming link without creating a temp file."""
     query = update.callback_query
     await query.answer()
     _, key, quality = query.data.split(":", 2)
@@ -214,48 +219,32 @@ async def save_to_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not video:
         await query.message.reply_text("Ссылка устарела. Пришли видео снова.")
         return
-    if context.user_data.get("busy"):
-        await query.message.reply_text("⏳ Сейчас уже готовится другое видео.")
+    base = download_jobs.public_base_url()
+    if not base:
+        await query.message.reply_text("⚠️ Публичный адрес сервера пока не настроен.")
         return
-    if not download_jobs.public_base_url():
-        await query.message.reply_text("⚠️ Сервер скачивания пока не настроен.")
+    if not download_jobs.quota(query.from_user.id):
+        await query.message.reply_text("⚠️ Слишком много загрузок за короткое время. Попробуй позже.")
         return
-    uid = query.from_user.id
-    if not download_jobs.quota(uid):
-        await query.message.reply_text("⚠️ Лимит: не более 3 попыток за час и 40 в сутки на весь бот.")
-        return
-    context.user_data["busy"] = True
     height = None if quality == "best" else int(quality)
-    status = await query.message.reply_text("⏳ Готовлю видео выбранного качества. Это может занять несколько минут…")
-
-    async def task() -> None:
-        try:
-            async with download_jobs.SLOTS:
-                token, filename, size = await download_jobs.prepare_and_register(video["url"], height)
-            address = f"{download_jobs.public_base_url()}/f/{token}"
-            markup = InlineKeyboardMarkup([[InlineKeyboardButton("📥 Скачать в Файлы", url=address)]])
-            await status.edit_text(
-                f"✅ Готово! {filename} — {human_size(size)}\n"
-                "Нажми кнопку ниже. Если Telegram откроет встроенный браузер, "
-                "выбери «Открыть в Safari»; файл будет в загрузках iPhone.\n"
-                "Ссылка действительна 20 минут, затем файл удалится.",
-                reply_markup=markup)
-        except download_jobs.DownloadTooBig:
-            await status.edit_text(
-                f"⚠️ Видео превышает лимит {download_jobs.MAX_MB} МБ. "
-                "Попробуй меньшее качество — для гигабайтных файлов нужна следующая версия сервера.")
-        except download_jobs.DownloadTooSlow:
-            await status.edit_text("⚠️ Подготовка заняла слишком много времени. Попробуй меньший размер.")
-        except yt_dlp.utils.DownloadError:
-            await status.edit_text(
-                "⚠️ Не удалось скачать поток. Видео может быть недоступно, требовать входа или использовать DRM.")
-        except Exception:
-            log.exception("File preparation failed")
-            await status.edit_text("⚠️ Не удалось подготовить файл. Попробуй другое качество или видео.")
-        finally:
-            context.user_data["busy"] = False
-
-    context.application.create_task(task(), update=update)
+    try:
+        token = stream_jobs.register_stream(video["url"], height)
+        address = f"{base}/stream/{token}"
+        label = f"{height}p" if height else "лучшее доступное"
+        markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton(f"📥 Скачать {label} в Файлы", url=address)
+        ]])
+        await query.message.reply_text(
+            f"✅ Выбрано качество: {label}.\\n\\n"
+            "Нажми кнопку ниже и открой ссылку в Safari. "
+            "Сервер будет передавать видео прямо на телефон по мере обработки. "
+            "Файл не загружается в Telegram и не сохраняется целиком на сервере.\\n\\n"
+            "Нет фиксированного лимита размера, но время загрузки ограничено примерно 13 минутами. "
+            "При обрыве загрузку придётся начать заново. "
+            "Ссылка действует 10 минут и рассчитана на одно скачивание.",
+            reply_markup=markup)
+    except stream_jobs.StreamUnavailable as exc:
+        await query.message.reply_text(f"⚠️ {exc}")
 
 
 async def telegram_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
