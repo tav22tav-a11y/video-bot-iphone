@@ -79,7 +79,7 @@ def prepare_video(url: str, height: int | None, work: Path) -> Path:
 
     with yt_dlp.YoutubeDL({
         "format": format_selector(height),
-        "format_sort": ["codec:h264", "ext:mp4:m4a"],
+        "format_sort": ["codec:avc:m4a", "ext:mp4:m4a"],
         "outtmpl": str(work / "video.%(ext)s"),
         "noplaylist": True,
         "playlist_items": "1",
