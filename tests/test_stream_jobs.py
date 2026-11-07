@@ -79,3 +79,51 @@ def test_no_arbitrary_size_cap_in_streaming_module():
         media("https://cdn.example.org/5000mb.mp4")], "height": 720}, 720)
     assert "-fs" not in args
     assert "-movflags" in args
+
+
+def test_http_streamed_mp4_without_server_file(monkeypatch):
+    """Real FFmpeg -> aiohttp -> client streaming integration test (localhost)."""
+    import asyncio
+    from aiohttp import ClientSession, web
+
+    source = media("https://cdn.example.org/video.mp4")
+    monkeypatch.setattr(stream, "_extract_info", lambda url: {"formats": [source]})
+    monkeypatch.setattr(stream, "_validate_dns", lambda urls: None)
+    monkeypatch.setattr(stream, "ffmpeg_args", lambda info, height: [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", "color=c=black:s=128x72:r=10:d=1",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=32000:duration=1",
+        "-shortest", "-c:v", "mpeg4", "-c:a", "aac",
+        "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+        "-f", "mp4", "pipe:1",
+    ])
+
+    async def run():
+        server = web.Application()
+        stream.register_routes(server)
+        runner = web.AppRunner(server)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        token = stream.register_stream("https://example.org/video", 720)
+        url = f"http://127.0.0.1:{port}/stream/{token}"
+        try:
+            async with ClientSession() as client:
+                async with client.head(url) as response:
+                    assert response.status == 200
+                    assert token in stream.STREAMS
+                async with client.get(url) as response:
+                    assert response.status == 200
+                    assert "attachment" in response.headers["Content-Disposition"]
+                    body = await response.read()
+                    assert len(body) > 1000
+                    assert b"ftyp" in body[:128]
+                    assert b"moof" in body
+                assert token not in stream.STREAMS
+                async with client.get(url) as response:
+                    assert response.status == 404
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
